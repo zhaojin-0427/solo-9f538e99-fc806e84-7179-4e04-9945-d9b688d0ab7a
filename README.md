@@ -36,6 +36,23 @@
 | `GET /stations/{station_id}/dates/{data_date}/versions/{version}/file` | 下载指定版本留存的原始 CSV（字节一致） |
 | `GET /health` | 健康检查 |
 
+### 存档路径安全与历史版本恢复
+
+- **新上传**的 `station_id` 必须是合法且可作为单个路径片段的标识；`.` / `..`
+  会被拒绝（HTTP 400），任何情况下都不会把 CSV 写到留存目录 `files/` 之外。
+  写入层 `db.persist_csv_file` 还会再次解析并校验最终路径，双重防护。
+- **修复前已发布**的越界版本（当初 `station_id` 误填为 `..`）仍然：
+  - 可通过 `records` / `versions` 正常查到版本记录与校验和；
+  - 可通过原下载接口取回**字节一致**的原始 CSV。
+- 下载时会按 `(station, date, version, file_id)` 定位历史原文件并核对登记校验和，
+  **不会使用数据库里的 `file_path` 去读取任意文件**。校验通过后把存档复制回
+  `files/_recovered/<编码后的站点>/<日期>/`，更新登记后再清理目录外的旧副本。
+- 原文件缺失返回 `410 archive_missing`；校验和不吻合返回 `422 archive_corrupt`；
+  两种情况都不会改动版本登记，也不会产生新的存档。
+- 复制或数据库更新失败返回 `500 archive_recovery_failed` 且 `"retryable": true`；
+  原文件与版本登记保持原样，稍后重试即可。同一版本的并发恢复由按版本加的文件锁
+  串行化，不会错绑文件。
+
 ### 失败安全保证
 
 - 原始 CSV 先写入临时文件，再 `os.replace` 原子落到**不可变路径**
@@ -47,11 +64,12 @@
 
 ```
 app/
-  config.py       # 数据目录配置（环境变量 PM25_DATA_DIR）
+  config.py       # 数据目录配置（环境变量 PM25_DATA_DIR）与路径片段校验
   validation.py   # CSV 解析与整批校验（错误行/缺失小时/原因）
   db.py           # SQLite 模式、乐观版本控制、事务与文件原子落盘
+  archive.py      # 安全存档路径、校验和核验、越界历史文件恢复
   main.py         # FastAPI 路由与错误处理
-tests/            # 35 个 pytest 用例（校验/API/并发/故障恢复）
+tests/            # 49 个 pytest 用例（校验/API/并发/故障恢复/存档恢复）
 Dockerfile
 docker-compose.yml
 requirements.txt

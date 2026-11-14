@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Path as PathParam, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import config, db
+from . import archive, config, db
 from .validation import CsvValidationError, parse_and_validate
 
 
@@ -46,6 +46,38 @@ def _validate_station(station_id: str) -> str:
             ),
         )
     return station_id
+
+
+def _validate_new_station(station_id: str) -> str:
+    """Like :func:`_validate_station`, but only for new writes.
+
+    A station id that cannot be used verbatim as a single path component
+    (``.`` / ``..``) would let the archive escape the retention directory,
+    so it is rejected before any file is written.  History and download of
+    versions published before this check remain available.
+    """
+    station_id = _validate_station(station_id)
+    if not config.is_safe_component(station_id):
+        raise HTTPException(
+            status_code=400,
+            detail="station_id 不能是 '.' 或 '..'，否则存档会越出留存目录",
+        )
+    return station_id
+
+
+@app.exception_handler(archive.ArchiveError)
+async def _archive_error_handler(
+    _request, exc: archive.ArchiveError
+) -> JSONResponse:
+    content = {
+        "error": exc.error_code,
+        "message": "无法提供该版本的原始文件",
+        "reason": exc.reason,
+    }
+    if isinstance(exc, archive.ArchiveRecoveryFailed):
+        content["retryable"] = True
+        content["detail"] = "原文件与版本登记均已保留，可稍后重试"
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(CsvValidationError)
@@ -97,7 +129,7 @@ async def upload_batch(
     file: UploadFile = File(..., description="含 hour,pm25 两列的 CSV"),
 ):
     """上传或补报某监测点某日的 24 小时数据（整批校验、整批替换）。"""
-    station_id = _validate_station(station_id)
+    station_id = _validate_new_station(station_id)
 
     raw = await file.read(MAX_UPLOAD_BYTES + 1)
     if not raw:
@@ -160,13 +192,13 @@ def download_version_file(
             detail="指定版本不存在",
         )
 
-    # Defense in depth: resolve and ensure the path stays inside FILES_DIR.
-    target = (config.FILES_DIR / row["file_path"]).resolve()
-    root = config.FILES_DIR.resolve()
-    if root not in target.parents and target != root:
-        raise HTTPException(status_code=400, detail="非法文件路径")
-    if not target.is_file():
-        raise HTTPException(status_code=410, detail="留存文件已丢失")
+    # Locates the archive from the registration (station/date/version/file_id),
+    # verifies it against the registered checksum, and repairs legacy
+    # out-of-tree files only with verified identical bytes. Raises Archive*
+    # errors, rendered by the handler above.
+    target = archive.ensure_archive(
+        row, station_id, data_date.isoformat(), version
+    )
 
     return FileResponse(
         target,

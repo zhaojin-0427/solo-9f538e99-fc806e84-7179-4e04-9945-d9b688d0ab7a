@@ -125,11 +125,26 @@ def persist_csv_file(
 
     Returns ``(file_id, relative_path)``. Raises :class:`PublishError` on any
     filesystem failure; no previously published file is touched.
+
+    The station component is validated *before* touching the filesystem and
+    the resolved final path is re-checked against ``FILES_DIR``, so a station
+    id such as ``..`` can never place a file outside the retention tree.
     """
+    if not config.is_safe_component(station_id):
+        raise PublishError(
+            f"station_id {station_id!r} is not a safe archive path component"
+        )
     file_id = uuid.uuid4().hex
     # Immutable per-version path: backfills never overwrite a stored CSV.
     rel_path = Path(station_id) / data_date / f"v{version}_{file_id}.csv"
-    final_path = config.FILES_DIR / rel_path
+    files_root = config.FILES_DIR.resolve()
+    final_path = (config.FILES_DIR / rel_path).resolve()
+    if final_path == files_root or files_root not in final_path.parents:
+        raise PublishError("refusing to store CSV outside the retention directory")
+    if not config.is_safe_component(data_date) or not config.is_safe_component(
+        final_path.name
+    ):
+        raise PublishError("unsafe archive path component")
     tmp_path = config.TMP_DIR / f".{file_id}.tmp.csv"
     try:
         final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +321,49 @@ def get_version_file(
         if row is None:
             return None
         return dict(row)
+    finally:
+        conn.close()
+
+
+def update_version_file_path(
+    station_id: str,
+    date_str: str,
+    version: int,
+    file_id: str,
+    checksum: str,
+    relative_path: str,
+) -> bool:
+    """Re-point a version registration at a restored in-tree archive.
+
+    The ``WHERE`` clause pins the registered ``file_id`` and ``checksum`` so
+    a concurrent publish/recovery can never rebind the update to a different
+    version's file. Returns ``False`` when the registration no longer
+    matches (nothing was changed).
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        updated = conn.execute(
+            "UPDATE upload_versions SET file_path = ? "
+            "WHERE station_id = ? AND data_date = ? AND version = ? "
+            "AND file_id = ? AND checksum = ?",
+            (
+                relative_path,
+                station_id,
+                date_str,
+                version,
+                file_id,
+                checksum,
+            ),
+        ).rowcount
+        conn.execute("COMMIT")
+        return updated == 1
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
     finally:
         conn.close()
 

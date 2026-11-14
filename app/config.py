@@ -19,3 +19,22 @@ def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def is_safe_component(value: str) -> bool:
+    """True when *value* can be used as exactly one path component.
+
+    ``.`` and ``..`` are rejected because the former is a no-op and the
+    latter walks out of the retention directory; path separators and NUL
+    bytes are rejected as well.
+    """
+    if not value or "\x00" in value:
+        return False
+    if value in (".", ".."):
+        return False
+    separators = {"/", "\\", os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    if any(sep in value for sep in separators):
+        return False
+    return True
